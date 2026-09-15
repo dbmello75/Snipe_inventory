@@ -1,0 +1,610 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# =========================================================
+# PATHS / ENV
+# =========================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env"
+
+if [ ! -f "$ENV_FILE" ]; then
+    echo "ERROR: .env file not found: $ENV_FILE"
+    exit 1
+fi
+
+set -a
+source "$ENV_FILE"
+set +a
+
+if [ -z "${SNIPE_TOKEN:-}" ]; then
+    echo "ERROR: SNIPE_TOKEN is not defined in .env"
+    exit 1
+fi
+
+SNIPE_URL="${SNIPE_URL:-https://elecrics.vicpro.co}"
+
+GLPI_APPIMAGE="$SCRIPT_DIR/glpi-agent-1.19-x86_64.AppImage"
+INVENTORY_JSON="/tmp/glpi-inventory.json"
+
+STATUS_ID=4
+FIELDSET_ID=2
+
+CATEGORY_LAPTOP=2
+CATEGORY_DESKTOP=3
+CATEGORY_MINIPC=4
+
+# =========================================================
+# REQUIREMENTS
+# =========================================================
+
+for CMD in jq curl; do
+    command -v "$CMD" >/dev/null 2>&1 || {
+        echo "ERROR: $CMD is required."
+        exit 1
+    }
+done
+
+if [ ! -x "$GLPI_APPIMAGE" ]; then
+    echo "ERROR: GLPI AppImage not found or not executable:"
+    echo "$GLPI_APPIMAGE"
+    exit 1
+fi
+
+# =========================================================
+# GLPI INVENTORY
+# =========================================================
+
+echo "Running GLPI Agent inventory..."
+
+sudo "$GLPI_APPIMAGE" \
+    --script=glpi-inventory \
+    --json > "$INVENTORY_JSON"
+
+if ! jq -e . "$INVENTORY_JSON" >/dev/null 2>&1; then
+    echo "ERROR: Invalid GLPI inventory JSON."
+    exit 1
+fi
+
+# =========================================================
+# BASIC SYSTEM INFO
+# =========================================================
+
+MANUFACTURER=$(jq -r '.content.bios.smanufacturer // "Unknown"' "$INVENTORY_JSON")
+MODEL=$(jq -r '.content.bios.smodel // "Unknown"' "$INVENTORY_JSON")
+SERIAL=$(jq -r '.content.bios.ssn // "Unknown"' "$INVENTORY_JSON")
+UUID=$(jq -r '.content.hardware.uuid // "Unknown"' "$INVENTORY_JSON")
+CHASSIS=$(jq -r '.content.hardware.chassis_type // "Unknown"' "$INVENTORY_JSON")
+
+if [ "$SERIAL" = "Unknown" ] || [ -z "$SERIAL" ]; then
+    echo "ERROR: No valid system serial number detected."
+    exit 1
+fi
+
+# =========================================================
+# CPU
+# =========================================================
+
+CPU=$(jq -r '
+    .content.cpus
+    | map(.name)
+    | unique
+    | join("; ")
+' "$INVENTORY_JSON")
+
+# =========================================================
+# GPU
+# =========================================================
+
+GPU=$(jq -r '
+    [
+        .content.controllers[]?
+        | select(
+            .type == "VGA compatible controller"
+            or .type == "3D controller"
+            or .pciclass == "0300"
+            or .pciclass == "0302"
+        )
+        | (.caption // .name // "Unknown GPU")
+    ]
+    | unique
+    | join("; ")
+' "$INVENTORY_JSON")
+
+# =========================================================
+# MEMORY
+# =========================================================
+
+RAM_MB=$(jq '
+    [.content.memories[]?.capacity // 0]
+    | add // 0
+' "$INVENTORY_JSON")
+
+RAM_TOTAL="$((RAM_MB / 1024)) GB"
+
+MEMORY_DETAILS=$(jq -r '
+    .content.memories[]?
+    |
+    "\(.caption // "Unknown Slot") | " +
+    "\((.capacity // 0) / 1024 | floor) GB | " +
+    "\(.type // "Unknown") | " +
+    "\(.speed // "Unknown") MT/s | " +
+    "\(.manufacturer // "Unknown") | " +
+    "SN \(.serialnumber // "Unknown") | " +
+    "PN \(.model // "Unknown")"
+' "$INVENTORY_JSON")
+
+# =========================================================
+# STORAGE
+# =========================================================
+
+STORAGE=$(jq -r '
+    [
+        .content.storages[]?
+        | select(.type == "disk")
+        |
+        "\(.model // "Unknown") | " +
+        "SN \(.serial // "Unknown") | " +
+        "\(
+            if (.disksize // 0) >= 1000000
+            then (((.disksize / 1000000) * 10 | floor) / 10 | tostring) + " TB"
+            elif (.disksize // 0) > 0
+            then (((.disksize / 1000) | floor) | tostring) + " GB"
+            else "Unknown Size"
+            end
+        ) | " +
+        "\(.interface // "Unknown")"
+    ]
+    | join("; ")
+' "$INVENTORY_JSON")
+
+STORAGE_SERIALS=$(jq -r '
+    [
+        .content.storages[]?
+        | select(.type == "disk")
+        | .serial
+        | select(. != null and . != "" and . != "Unknown")
+    ]
+    | sort
+    | join(";")
+' "$INVENTORY_JSON")
+
+# =========================================================
+# NETWORK
+# =========================================================
+
+MAC=$(jq -r '
+    (
+        [
+            .content.networks[]?
+            | select(.virtualdev == false)
+            | select(.type == "ethernet")
+            | .mac
+            | select(. != null)
+        ][0]
+    ) //
+    (
+        [
+            .content.networks[]?
+            | select(.virtualdev == false)
+            | select(.type == "wifi")
+            | .mac
+            | select(. != null)
+        ][0]
+    ) //
+    ""
+' "$INVENTORY_JSON")
+
+# =========================================================
+# CATEGORY DETECTION
+# =========================================================
+
+CHASSIS_LC=$(echo "$CHASSIS" | tr '[:upper:]' '[:lower:]')
+
+case "$CHASSIS_LC" in
+    *mini*)
+        CATEGORY_ID=$CATEGORY_MINIPC
+        CATEGORY_NAME="Mini PC"
+        ;;
+    *laptop*|*notebook*|*portable*)
+        CATEGORY_ID=$CATEGORY_LAPTOP
+        CATEGORY_NAME="Laptop"
+        ;;
+    *desktop*|*tower*)
+        CATEGORY_ID=$CATEGORY_DESKTOP
+        CATEGORY_NAME="Desktop"
+        ;;
+    *)
+        echo
+        echo "Unknown chassis type: $CHASSIS"
+        echo "1) Laptop"
+        echo "2) Desktop"
+        echo "3) Mini PC"
+        read -r -p "> " CHOICE
+
+        case "$CHOICE" in
+            1) CATEGORY_ID=$CATEGORY_LAPTOP; CATEGORY_NAME="Laptop" ;;
+            2) CATEGORY_ID=$CATEGORY_DESKTOP; CATEGORY_NAME="Desktop" ;;
+            3) CATEGORY_ID=$CATEGORY_MINIPC; CATEGORY_NAME="Mini PC" ;;
+            *)
+                echo "Invalid selection."
+                exit 1
+                ;;
+        esac
+        ;;
+esac
+
+# =========================================================
+# FIND / CREATE MANUFACTURER
+# =========================================================
+
+MANUFACTURER_RESPONSE=$(curl -s \
+    -G \
+    -H "Authorization: Bearer $SNIPE_TOKEN" \
+    -H "Accept: application/json" \
+    --data-urlencode "search=$MANUFACTURER" \
+    "$SNIPE_URL/api/v1/manufacturers")
+
+MANUFACTURER_ID=$(echo "$MANUFACTURER_RESPONSE" | jq -r \
+    --arg NAME "$MANUFACTURER" \
+    '.rows[]?
+     | select((.name | ascii_downcase) == ($NAME | ascii_downcase))
+     | .id' | head -1)
+
+if [ -z "$MANUFACTURER_ID" ]; then
+    echo "Creating manufacturer: $MANUFACTURER"
+
+    RESPONSE=$(curl -s -X POST \
+        -H "Authorization: Bearer $SNIPE_TOKEN" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        "$SNIPE_URL/api/v1/manufacturers" \
+        -d "$(jq -n --arg name "$MANUFACTURER" '{name:$name}')")
+
+    MANUFACTURER_ID=$(echo "$RESPONSE" | jq -r '.payload.id // empty')
+
+    if [ -z "$MANUFACTURER_ID" ]; then
+        echo "ERROR creating manufacturer:"
+        echo "$RESPONSE" | jq
+        exit 1
+    fi
+fi
+
+# =========================================================
+# FIND / CREATE MODEL
+# =========================================================
+
+MODEL_RESPONSE=$(curl -s \
+    -G \
+    -H "Authorization: Bearer $SNIPE_TOKEN" \
+    -H "Accept: application/json" \
+    --data-urlencode "search=$MODEL" \
+    "$SNIPE_URL/api/v1/models")
+
+MODEL_ID=$(echo "$MODEL_RESPONSE" | jq -r \
+    --arg MODEL "$MODEL" \
+    --argjson MID "$MANUFACTURER_ID" \
+    '.rows[]?
+     | select((.name | ascii_downcase) == ($MODEL | ascii_downcase))
+     | select(.manufacturer.id == $MID)
+     | .id' | head -1)
+
+if [ -z "$MODEL_ID" ]; then
+    echo "Creating model: $MODEL"
+
+    MODEL_JSON=$(jq -n \
+        --arg name "$MODEL" \
+        --argjson manufacturer_id "$MANUFACTURER_ID" \
+        --argjson category_id "$CATEGORY_ID" \
+        --argjson fieldset_id "$FIELDSET_ID" \
+        '{
+            name: $name,
+            manufacturer_id: $manufacturer_id,
+            category_id: $category_id,
+            fieldset_id: $fieldset_id
+        }')
+
+    RESPONSE=$(curl -s -X POST \
+        -H "Authorization: Bearer $SNIPE_TOKEN" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        "$SNIPE_URL/api/v1/models" \
+        -d "$MODEL_JSON")
+
+    MODEL_ID=$(echo "$RESPONSE" | jq -r '.payload.id // empty')
+
+    if [ -z "$MODEL_ID" ]; then
+        echo "ERROR creating model:"
+        echo "$RESPONSE" | jq
+        exit 1
+    fi
+fi
+
+# =========================================================
+# LOCAL INVENTORY SUMMARY
+# =========================================================
+
+echo
+echo "======================================================"
+echo "              EQUIPMENT INVENTORY"
+echo "======================================================"
+echo "Manufacturer: $MANUFACTURER"
+echo "Model:        $MODEL"
+echo "Category:     $CATEGORY_NAME"
+echo "Serial:       $SERIAL"
+echo "UUID:         $UUID"
+echo "CPU:          $CPU"
+echo "GPU:          ${GPU:-None detected}"
+echo "RAM Total:    $RAM_TOTAL"
+
+echo
+echo "Memory:"
+if [ -n "$MEMORY_DETAILS" ]; then
+    echo "$MEMORY_DETAILS" | sed 's/^/  /'
+else
+    echo "  None detected"
+fi
+
+echo
+echo "Storage:"
+if [ -n "$STORAGE" ]; then
+    echo "  $STORAGE"
+else
+    echo "  No internal storage detected"
+fi
+
+echo
+echo "MAC:          ${MAC:-None detected}"
+echo "======================================================"
+echo
+
+# =========================================================
+# FIND EXISTING ASSET
+# =========================================================
+
+EXISTING=$(curl -s \
+    -G \
+    -H "Authorization: Bearer $SNIPE_TOKEN" \
+    -H "Accept: application/json" \
+    --data-urlencode "search=$SERIAL" \
+    "$SNIPE_URL/api/v1/hardware")
+
+EXISTING_ID=$(echo "$EXISTING" | jq -r \
+    --arg SERIAL "$SERIAL" \
+    '.rows[]? | select(.serial == $SERIAL) | .id' \
+    | head -1)
+
+# =========================================================
+# CREATE NEW ASSET
+# =========================================================
+
+if [ -z "$EXISTING_ID" ]; then
+    echo "New asset detected."
+
+    read -r -p "Lot ID (leave blank if none): " LOT_ID
+    read -r -p "Create asset? [y/N]: " CONFIRM
+
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Cancelled."
+        exit 0
+    fi
+
+    ASSET_JSON=$(jq -n \
+        --arg name "$MODEL" \
+        --arg serial "$SERIAL" \
+        --arg cpu "$CPU" \
+        --arg gpu "$GPU" \
+        --arg ram "$RAM_TOTAL" \
+        --arg memory "$MEMORY_DETAILS" \
+        --arg storage "$STORAGE" \
+        --arg uuid "$UUID" \
+        --arg mac "$MAC" \
+        --arg lot "$LOT_ID" \
+        --argjson model_id "$MODEL_ID" \
+        --argjson status_id "$STATUS_ID" \
+        '{
+            model_id: $model_id,
+            status_id: $status_id,
+            name: $name,
+            serial: $serial,
+            "_snipeit_cpu_2": $cpu,
+            "_snipeit_gpu_8": $gpu,
+            "_snipeit_storage_3": $storage,
+            "_snipeit_system_uuid_4": $uuid,
+            "_snipeit_mac_address_1": $mac,
+            "_snipeit_lot_id_5": $lot,
+            "_snipeit_ram_total_6": $ram,
+            "_snipeit_memory_details_7": $memory
+        }')
+
+    RESPONSE=$(curl -s -X POST \
+        -H "Authorization: Bearer $SNIPE_TOKEN" \
+        -H "Accept: application/json" \
+        -H "Content-Type: application/json" \
+        "$SNIPE_URL/api/v1/hardware" \
+        -d "$ASSET_JSON")
+
+    echo "$RESPONSE" | jq
+
+    if [ "$(echo "$RESPONSE" | jq -r '.status // empty')" = "success" ]; then
+        echo
+        echo "Asset created successfully."
+        echo "Asset Tag: $(echo "$RESPONSE" | jq -r '.payload.asset_tag')"
+    else
+        echo "ERROR creating asset."
+        exit 1
+    fi
+
+    exit 0
+fi
+
+# =========================================================
+# LOAD EXISTING ASSET
+# =========================================================
+
+echo "Existing asset found: ID $EXISTING_ID"
+
+CURRENT=$(curl -s \
+    -H "Authorization: Bearer $SNIPE_TOKEN" \
+    -H "Accept: application/json" \
+    "$SNIPE_URL/api/v1/hardware/$EXISTING_ID")
+
+ASSET_TAG=$(echo "$CURRENT" | jq -r '.asset_tag // ""')
+
+get_custom_field () {
+    FIELD_NAME="$1"
+
+    echo "$CURRENT" | jq -r \
+        --arg FIELD "$FIELD_NAME" '
+        [
+            .custom_fields
+            | to_entries[]
+            | select(.value.field == $FIELD)
+            | .value.value
+        ][0] // ""
+    '
+}
+
+CURRENT_CPU=$(get_custom_field "_snipeit_cpu_2")
+CURRENT_GPU=$(get_custom_field "_snipeit_gpu_8")
+CURRENT_RAM=$(get_custom_field "_snipeit_ram_total_6")
+CURRENT_MEMORY=$(get_custom_field "_snipeit_memory_details_7")
+CURRENT_STORAGE=$(get_custom_field "_snipeit_storage_3")
+CURRENT_UUID=$(get_custom_field "_snipeit_system_uuid_4")
+CURRENT_MAC=$(get_custom_field "_snipeit_mac_address_1")
+
+CURRENT_STORAGE_SERIALS=$(printf '%s\n' "$CURRENT_STORAGE" \
+    | grep -oE 'SN [^ |;]+' \
+    | sed 's/^SN //' \
+    | sort \
+    | paste -sd ';' - \
+    || true)
+
+# =========================================================
+# FULL COMPARISON
+# =========================================================
+
+CHANGES=0
+
+echo
+echo "======================================================"
+echo "ASSET FOUND: $ASSET_TAG"
+echo "CURRENT vs DETECTED HARDWARE"
+echo "======================================================"
+
+compare_field () {
+    LABEL="$1"
+    OLD="$2"
+    NEW="$3"
+
+    echo
+    echo "$LABEL"
+    echo "  OLD: ${OLD:-<empty>}"
+    echo "  NEW: ${NEW:-<empty>}"
+
+    if [ "$OLD" = "$NEW" ]; then
+        echo "  [OK]"
+    else
+        echo "  [CHANGED]"
+        CHANGES=$((CHANGES + 1))
+    fi
+}
+
+compare_field "CPU" "$CURRENT_CPU" "$CPU"
+compare_field "GPU" "$CURRENT_GPU" "$GPU"
+compare_field "RAM Total" "$CURRENT_RAM" "$RAM_TOTAL"
+compare_field "Memory Details" "$CURRENT_MEMORY" "$MEMORY_DETAILS"
+compare_field "System UUID" "$CURRENT_UUID" "$UUID"
+compare_field "MAC Address" "$CURRENT_MAC" "$MAC"
+
+# =========================================================
+# STORAGE - SERIAL BASED COMPARISON
+# =========================================================
+
+echo
+echo "Storage"
+echo "  OLD: ${CURRENT_STORAGE:-<no storage>}"
+echo "  NEW: ${STORAGE:-<no storage>}"
+echo "  OLD Serial(s): ${CURRENT_STORAGE_SERIALS:-<none>}"
+echo "  NEW Serial(s): ${STORAGE_SERIALS:-<none>}"
+
+if [ "$CURRENT_STORAGE_SERIALS" = "$STORAGE_SERIALS" ]; then
+    echo "  [OK - same storage serial(s)]"
+else
+    echo "  [CHANGED - storage serial changed]"
+    CHANGES=$((CHANGES + 1))
+fi
+
+echo
+echo "======================================================"
+
+# =========================================================
+# NO CHANGES
+# =========================================================
+
+if [ "$CHANGES" -eq 0 ]; then
+    echo
+    echo "No hardware changes detected."
+    exit 0
+fi
+
+echo
+echo "$CHANGES hardware change(s) detected."
+
+# =========================================================
+# CONFIRM UPDATE
+# =========================================================
+
+read -r -p "Update technical inventory? [y/N]: " CONFIRM
+
+if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+    echo "No changes made."
+    exit 0
+fi
+
+# =========================================================
+# UPDATE EXISTING ASSET
+# =========================================================
+
+UPDATE_JSON=$(jq -n \
+    --arg cpu "$CPU" \
+    --arg gpu "$GPU" \
+    --arg ram "$RAM_TOTAL" \
+    --arg memory "$MEMORY_DETAILS" \
+    --arg storage "$STORAGE" \
+    --arg uuid "$UUID" \
+    --arg mac "$MAC" \
+    '{
+        "_snipeit_cpu_2": $cpu,
+        "_snipeit_gpu_8": $gpu,
+        "_snipeit_storage_3": $storage,
+        "_snipeit_system_uuid_4": $uuid,
+        "_snipeit_mac_address_1": $mac,
+        "_snipeit_ram_total_6": $ram,
+        "_snipeit_memory_details_7": $memory
+    }')
+
+RESPONSE=$(curl -s -X PATCH \
+    -H "Authorization: Bearer $SNIPE_TOKEN" \
+    -H "Accept: application/json" \
+    -H "Content-Type: application/json" \
+    "$SNIPE_URL/api/v1/hardware/$EXISTING_ID" \
+    -d "$UPDATE_JSON")
+
+echo
+echo "$RESPONSE" | jq
+
+if [ "$(echo "$RESPONSE" | jq -r '.status // empty')" = "success" ]; then
+    echo
+    echo "======================================================"
+    echo "ASSET UPDATED SUCCESSFULLY"
+    echo "Asset Tag: $ASSET_TAG"
+    echo "Serial:    $SERIAL"
+    echo "Changes:   $CHANGES"
+    echo "======================================================"
+else
+    echo
+    echo "ERROR updating asset."
+    exit 1
+fi
